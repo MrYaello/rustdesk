@@ -1,18 +1,84 @@
-
 name: Dienstmotor Build
 
 on:
   workflow_dispatch:
+    inputs:
+      build:
+        description: "Compilar de nuevo (desmarca para solo republicar lo que ya hay en test-build)"
+        type: boolean
+        default: true
+      publish:
+        description: "Publicar release estable con los archivos renombrados a dienstmotor-remote"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+env:
+  STAGING_TAG: test-build
+  ASSET_PREFIX: dienstmotor-remote
+
 jobs:
   build:
     name: Build RustDesk
+    if: ${{ inputs.build }}
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: true
       upload-tag: test-build
       publish-update-metadata: false
     secrets: inherit
+
+  # flutter-build.yml (upstream) sube todo a test-build con el prefijo "rustdesk-".
+  # Aquí se renombra a "dienstmotor-remote-" y se publica como release estable,
+  # sin tocar el workflow de upstream para no complicar los merges.
+  publish:
+    name: Publish Dienstmotor Remote release
+    needs: build
+    if: ${{ !cancelled() && inputs.publish && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: Cargo.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Read version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # Las variantes sciter y el tar sin firmar no se publican. Ojo: el nombre no debe
+      # contener "--", "-qs", "-licensed-" ni "host=", porque RustDesk interpreta el
+      # nombre del .exe (src/custom_server.rs, src/core_main.rs).
+      - name: Download and rename assets
+        run: |
+          mkdir dist && cd dist
+          gh release download "$STAGING_TAG" \
+            --pattern "rustdesk-${VERSION}-*" \
+            --pattern "rustdesk-*-${VERSION}-*"
+          rm -f rustdesk-*-sciter.* rustdesk-*-unsigned.tar.gz
+          for f in rustdesk-*; do
+            mv -- "$f" "${ASSET_PREFIX}-${f#rustdesk-}"
+          done
+          sha256sum "${ASSET_PREFIX}"-* > SHA256SUMS.txt
+          ls -la
+
+      - name: Publish release
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "Dienstmotor Remote ${VERSION}" \
+              --notes "Dienstmotor Remote ${VERSION}, basado en RustDesk (AGPL-3.0). Verifica los archivos con SHA256SUMS.txt." \
+              --latest
+          fi
